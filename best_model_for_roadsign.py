@@ -6,14 +6,28 @@ import time
 from flask import Flask, jsonify
 from ctypes import c_int
 import re  # For optimized speed limit extraction
+import socket
+import threading
 
-# Shared value for speed limit with a lock
-shared_value = multiprocessing.Value(c_int, 0)
+HOST = "192.168.254.99"  # Replace with ESP32's IP
+PORT = 8080
+
+shared_value = multiprocessing.Value(c_int, 80)  # Speed limit
+shared_sensor_data = multiprocessing.Value('d', 0)  # Sensor data
 lock = multiprocessing.Lock()
 
 app = Flask(__name__)
 
-# Function to fetch token
+def send_data_esp32(sensor_data, speed_limit):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((HOST, PORT))
+            data = f"SENSOR:{sensor_data}\nLIMIT:{speed_limit}\n"
+            s.sendall(data.encode())
+    except Exception as e:
+        print("ESP32 Socket Error:", e)
+
 def get_token():
     try:
         auth_url = "http://wazigate.local/auth/token"
@@ -21,37 +35,40 @@ def get_token():
         response = requests.post(auth_url, json=credentials, timeout=5)
         if response.status_code == 200:
             return response.json()
-        return None
     except requests.RequestException as e:
         print("Token Error:", e)
-        return None
+    return None
 
-# Function to fetch sensor data
 def get_sensor_data(token):
     try:
         sensor_url = "http://wazigate.local/devices/b827ebae5f25058c/sensors"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         response = requests.get(sensor_url, headers=headers, timeout=5)
         if response.status_code == 200:
-            Data = response.json()
-            Data = Data[0].get("value")
-            return Data
-        return {"error": "Failed to fetch sensor data"}
+            data = response.json()
+            return data[0].get("value")
     except requests.RequestException as e:
         print("Sensor Data Error:", e)
-        return {"error": str(e)}
+    return None
 
-# API to send vehicle data
+def fetch_sensor_data_periodically():
+    while True:
+        token = get_token()
+        if token:
+            sensor_data = get_sensor_data(token)
+            if isinstance(sensor_data, (int, float)):
+                sensor_data *= 7.5
+                with lock:
+                    shared_sensor_data.value = sensor_data
+        time.sleep(5)
+
 @app.route('/api/vehicle-data')
 def send_data():
-    token = get_token()
-    if not token:
-        return jsonify({"error": "Authentication failed"}), 404
-
-    sensor_data = get_sensor_data(token)
-
     with lock:
-        current_speed_limit = shared_value.value  # Safely read shared value
+        current_speed_limit = shared_value.value
+        current_sensor_data = shared_sensor_data.value
+
+    is_overspeed = current_sensor_data > current_speed_limit
 
     data = {
         "vehicle_id": "TZ 322 ABC",
@@ -61,8 +78,8 @@ def send_data():
         "driver_name": "Simon sosola Sylas",
         "driver_license": "D123456789",
         "speed_limit": current_speed_limit,
-        "current_speed": sensor_data,
-        "is_overspeed": False,
+        "current_speed": current_sensor_data,
+        "is_overspeed": is_overspeed,
         "registration_number": "Asds-sd23-ds",
         "vehicle_type": "Truck",
         "contact_number": "+255629110284",
@@ -71,15 +88,13 @@ def send_data():
     }
     return jsonify(data)
 
-# Function to run Flask server in a separate process
 def run_server():
     app.run(debug=False, use_reloader=False, threaded=True, host="0.0.0.0", port=5000)
 
-# Main vision system function
 def main():
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not cap.isOpened():
         print("Error: Could not open camera.")
@@ -88,61 +103,62 @@ def main():
     import inference
     model = inference.get_model("road_sign-detector/3")
 
-    frame_counter = 0  # To process every 3rd frame only
+    frame_counter = 0
+    last_sent_time = time.time()
 
     while True:
-        success, img = cap.read()
+        success, frame = cap.read()
         if not success:
-            print("Error: Frame capture failed.")
+            print("Frame capture failed.")
             continue
 
         frame_counter += 1
-        if frame_counter % 3 != 0:  # Skip frames for efficiency
-            time.sleep(0.01)  # Reduce CPU usage
+
+        # Send to ESP32 every second
+        if time.time() - last_sent_time > 1:
+            with lock:
+                send_data_esp32(shared_sensor_data.value, shared_value.value)
+            last_sent_time = time.time()
+
+        if frame_counter % 5 != 0:
             continue
 
         try:
-            img1 = cv2.resize(img, (640, 640))
-            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-            img1 = cv2.equalizeHist(img1).reshape(640, 640, 1)
+            img_resized = cv2.resize(frame, (640, 640))
+            img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+            img_input = img_gray.reshape(640, 640, 1)
 
-            result = model.infer(image=img1)
-            result = list(result)[0].predictions
+            result = list(model.infer(image=img_input))[0].predictions
 
             if result:
-                class_name = result[0].class_name
-                conf = result[0].confidence
-                x1, y1, x2, y2 = map(int, (result[0].x, result[0].y, result[0].width, result[0].height))
+                pred = result[0]
+                x, y, w, h = map(int, (pred.x, pred.y, pred.width, pred.height))
+                label = f"{pred.confidence:.2f} : {pred.class_name}"
 
-                cv2.rectangle(img, (x1, y1), (x1 + x2, y1 + y2), (255, 0, 0), 3)
-                label_str = f"{conf:.2f} : {class_name}"
+                if pred.confidence >= 0.70:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 3)
+                    cvzone.putTextRect(frame, label, (x - 25, y), 1, 2)
 
-                if conf >= 0.70:
-                    cvzone.putTextRect(img, label_str, (x1 - 25, y1), 1, 2)
-
-                    # Optimized way to extract speed limit from class_name
-                    match = re.search(r"t-(\d+)k", class_name)
+                    match = re.search(r"t-(\d+)k", pred.class_name)
                     if match:
-                        speed_limit = int(match.group(1))  # Extract number
                         with lock:
-                            shared_value.value = speed_limit
+                            shared_value.value = int(match.group(1))
 
-        except (IndexError, ValueError) as e:
-            print("Processing Error:", e)
+        except Exception as e:
+            print("Inference error:", e)
 
-        # Display the image output
-        cv2.imshow("image", img)
+        cv2.imshow("image", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 if __name__ == "__main__":
-    # Run Flask in a separate process
     flask_process = multiprocessing.Process(target=run_server)
     flask_process.start()
 
-    # Run main vision processing
+    sensor_thread = threading.Thread(target=fetch_sensor_data_periodically, daemon=True)
+    sensor_thread.start()
+
     main()
 
-    # Ensure Flask process terminates cleanly
     flask_process.terminate()
     flask_process.join()
